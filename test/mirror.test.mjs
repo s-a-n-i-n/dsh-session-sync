@@ -171,3 +171,31 @@ test('restore updates inactive sessions, skips fork carriers, and can defer live
     )),
   )
 })
+
+
+test('outbound mirror preserves deferred session bytes already present in the sync mirror', async (t) => {
+  const { root, clean } = await makeTemp()
+  t.after(clean)
+  const sessionRoot = path.join(root, 'sessions')
+  const repoDir = path.join(root, 'repo')
+  const live = path.join(sessionRoot, 'project', 'session-deferred', 'session.jsonl.zstd')
+  const mirror = path.join(repoDir, 'sessions', 'project', 'session-deferred', 'session.jsonl.zstd')
+  const mirrorExtra = path.join(repoDir, 'sessions', 'project', 'session-deferred', 'remote-only.bin')
+
+  await fs.mkdir(path.dirname(live), { recursive: true })
+  await fs.mkdir(path.dirname(mirror), { recursive: true })
+  await fs.writeFile(live, 'stale-live')
+  await fs.writeFile(mirror, 'newer-inbound')
+  await fs.writeFile(mirrorExtra, 'remote-only')
+
+  const result = await mirrorSessionRoot({
+    sessionRoot,
+    repoDir,
+    mirrorDir: 'sessions',
+    skipSessionIds: ['session-deferred'],
+  })
+
+  assert.deepEqual(result.skippedSessionIds, ['session-deferred'])
+  assert.equal(await fs.readFile(mirror, 'utf8'), 'newer-inbound')
+  assert.equal(await fs.readFile(mirrorExtra, 'utf8'), 'remote-only')
+})
