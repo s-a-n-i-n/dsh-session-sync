@@ -781,9 +781,10 @@ export async function apply(ctx, config = {}) {
           // machine layout. Avoid manufacturing a duplicate project workspace
           // when the same directory leaf is already registered elsewhere;
           // leave that historical Session ungrouped instead.
-          const incomingLeaf = path.basename(header.cwd).toLocaleLowerCase()
+          const leafOf = value => path.posix.basename(String(value).replaceAll('\\', '/')).toLocaleLowerCase()
+          const incomingLeaf = leafOf(header.cwd)
           const collision = registry.list().find(candidate =>
-            path.basename(candidate.path).toLocaleLowerCase() === incomingLeaf)
+            leafOf(candidate.path) === incomingLeaf)
           if (collision !== undefined) {
             warn(`session-sync: restored session ${sessionId} has cwd ${header.cwd}, but project ${path.basename(header.cwd)} is already registered at ${collision.path}; leaving it ungrouped`)
             continue
