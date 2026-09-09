@@ -104,6 +104,8 @@ test('engine end-to-end: push, adopt, append-both fork, diverged fork, rejected 
   assert.equal(pull2.ok, true, `B first pull failed: ${pull2.error}`)
   assert.equal(pull2.pulled, true)
   assert.equal(await readWorktree(b.repoDir, 'sessions/s1/log.jsonl'), 'line1\n')
+  assert.equal(await fs.readFile(path.join(b.sessionRoot, 's1', 'log.jsonl'), 'utf8'), 'line1\n')
+  assert.equal(pull2.restored, 1)
 
   // 3) A 本地追加并推送。
   await writeSession(a.sessionRoot, 's1/log.jsonl', 'line1\nA-more\n')
@@ -133,6 +135,7 @@ test('engine end-to-end: push, adopt, append-both fork, diverged fork, rejected 
   assert.equal(pull6.appended, 0)
   assert.equal(pull6.forks.length, 0)
   assert.equal(await readWorktree(a.repoDir, 'sessions/s1/log.jsonl'), 'line1\nB-more\n')
+  assert.equal(await fs.readFile(path.join(a.sessionRoot, 's1', 'log.jsonl'), 'utf8'), 'line1\nB-more\n')
   const aStatus = await a.engine.status()
   assert.ok(aStatus.forks.some(fork => fork.includes('log.jsonl.remote-fork-')), 'A keeps the earlier fork file of its own version')
 
