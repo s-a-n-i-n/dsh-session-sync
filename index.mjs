@@ -1014,12 +1014,13 @@ export async function apply(ctx, config = {}) {
     const registry = /** @type {any} */ (ctx).get('workspaceRegistry')
     let knownArchived = new Set([...(registry?.archivedSessionIds ?? [])].map(String))
     ctx.on('domain/changed', (change) => {
+      const value = /** @type {any} */ (change?.value)
       if (change?.domain !== 'workspace'
         || change.table !== ''
         || change.key !== ''
         || change.operation !== 'put'
-        || !Array.isArray(change.value?.archivedSessionIds)) return
-      const next = new Set(change.value.archivedSessionIds.map(String))
+        || !Array.isArray(value?.archivedSessionIds)) return
+      const next = new Set(value.archivedSessionIds.map(String))
       const added = [...next].some(id => !knownArchived.has(id))
       knownArchived = next
       if (!added) return
