@@ -344,7 +344,7 @@ const TOOL_TEXT = {
 
 /** sync_status 工具规范结果（与工具 schema 同构）。 */
 /** @typedef {{ok: boolean, branch: string, remote: string, head?: string, remoteHead?: string, ahead: number, behind: number, dirty: string[], forks: string[], diffStat: string, mergeInProgress: boolean, lastCommits: string[], lastPullAt?: number, lastPushAt?: number, lastError?: string, error?: string, warnings?: string[]}} StatusValue */
-/** @typedef {{ok: boolean, pulled?: boolean, merged?: boolean, adopted?: number, appended?: number, diverged?: number, forks?: string[], head?: string, error?: string, warnings?: string[]}} PullValue */
+/** @typedef {{ok: boolean, pulled?: boolean, merged?: boolean, adopted?: number, appended?: number, diverged?: number, forks?: string[], head?: string, restored?: number, restoredSessionIds?: string[], deferredSessionIds?: string[], error?: string, warnings?: string[]}} PullValue */
 /** @typedef {{ok: boolean, pushed?: boolean, head?: string, mirrored?: number, deleted?: number, remote?: string, error?: string, warnings?: string[]}} PushValue */
 
 /**
@@ -391,7 +391,11 @@ export function makeSyncStatusTool(engine, readMeta) {
       const status = await engine.status()
       try {
         const meta = await readMeta()
-        return { ...status, lastPullAt: meta.lastPullAt, lastPushAt: meta.lastPushAt, lastError: meta.lastError }
+        const extra = {}
+        if (meta.lastPullAt !== undefined) extra.lastPullAt = meta.lastPullAt
+        if (meta.lastPushAt !== undefined) extra.lastPushAt = meta.lastPushAt
+        if (meta.lastError !== undefined) extra.lastError = meta.lastError
+        return { ...status, ...extra }
       } catch {
         return status
       }
@@ -422,6 +426,9 @@ export function makeSyncPullTool(deps) {
           diverged: { type: 'integer' },
           forks: { type: 'array', items: { type: 'string' } },
           head: { type: 'string' },
+          restored: { type: 'integer' },
+          restoredSessionIds: { type: 'array', items: { type: 'string' } },
+          deferredSessionIds: { type: 'array', items: { type: 'string' } },
           error: { type: 'string' },
           warnings: { type: 'array', items: { type: 'string' } },
         },
@@ -610,6 +617,47 @@ export function apply(ctx, config = {}) {
     reportMeta({ lastError: message.slice(0, 500) })
   }
 
+  /**
+   * Reconcile restored persistent sessions with an already-initialized DSH
+   * Workspace registry. DSH intentionally does not infer membership from cwd
+   * after first bootstrap, so cross-device imports must attach explicitly.
+   *
+   * This is best-effort host integration: restored bytes remain valid even if
+   * a profile does not compose sessionPersistence/workspaceRegistry.
+   */
+  async function reconcileRestoredSessions(restore) {
+    const sessionIds = restore?.availableSessionIds ?? []
+    if (sessionIds.length === 0) return
+
+    const persistence = ctx.get('sessionPersistence')
+    const registry = ctx.get('workspaceRegistry')
+    if (persistence === undefined || registry === undefined) {
+      logger.debug('session-sync: restored sessions left ungrouped because workspace services are unavailable')
+      return
+    }
+
+    let snapshots
+    try {
+      snapshots = await persistence.list()
+    } catch (error) {
+      warn(`session-sync: restored sessions are on disk but workspace reconciliation could not list persistence: ${messageOf(error)}`)
+      return
+    }
+    const byId = new Map(snapshots.map(snapshot => [String(snapshot.header.id), snapshot.header]))
+
+    for (const sessionId of sessionIds) {
+      const header = byId.get(String(sessionId))
+      if (header?.cwd === undefined) continue
+      try {
+        const workspace = await registry.resolveByPath(header.cwd)
+        if (workspace === undefined) continue
+        await workspace.attachSession(sessionId)
+      } catch (error) {
+        warn(`session-sync: restored session ${sessionId} is on disk but could not attach to its workspace: ${messageOf(error)}`)
+      }
+    }
+  }
+
   // --- git 后端 + 引擎（backend seam：git = 明文，encrypted = age 加密的 git）。
   const git = new GitBackend({
     repoDir,
@@ -637,6 +685,10 @@ export function apply(ctx, config = {}) {
     reportError,
     logger,
     onForks: (forkPaths) => handleForks(forkPaths),
+    // Never overwrite a Session currently owned by the live host. A later
+    // pull/restart can materialize the deferred remote version safely.
+    shouldRestoreSession: (sessionId) => ctx.sessions.get(sessionId) === undefined,
+    onRestored: (restore) => reconcileRestoredSessions(restore),
   }
   const engine = resolved.backend === BACKENDS.ENCRYPTED
     ? new EncryptedBackend({
