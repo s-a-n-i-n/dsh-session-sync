@@ -391,11 +391,12 @@ export function makeSyncStatusTool(engine, readMeta) {
       const status = await engine.status()
       try {
         const meta = await readMeta()
-        const extra = {}
-        if (meta.lastPullAt !== undefined) extra.lastPullAt = meta.lastPullAt
-        if (meta.lastPushAt !== undefined) extra.lastPushAt = meta.lastPushAt
-        if (meta.lastError !== undefined) extra.lastError = meta.lastError
-        return { ...status, ...extra }
+        return {
+          ...status,
+          ...(meta.lastPullAt === undefined ? {} : { lastPullAt: meta.lastPullAt }),
+          ...(meta.lastPushAt === undefined ? {} : { lastPushAt: meta.lastPushAt }),
+          ...(meta.lastError === undefined ? {} : { lastError: meta.lastError }),
+        }
       } catch {
         return status
       }
@@ -629,8 +630,8 @@ export function apply(ctx, config = {}) {
     const sessionIds = restore?.availableSessionIds ?? []
     if (sessionIds.length === 0) return
 
-    const persistence = ctx.get('sessionPersistence')
-    const registry = ctx.get('workspaceRegistry')
+    const persistence = /** @type {any} */ (ctx).get('sessionPersistence')
+    const registry = /** @type {any} */ (ctx).get('workspaceRegistry')
     if (persistence === undefined || registry === undefined) {
       logger.debug('session-sync: restored sessions left ungrouped because workspace services are unavailable')
       return
