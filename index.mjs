@@ -29,6 +29,7 @@ import {
   CONFIRM_CHANNELS,
   DEFAULTS,
   LIMITS,
+  MIRROR_DIR,
   PLUGIN_NAME,
   SESSION_EVENTS,
   STATE_KEY,
@@ -52,6 +53,7 @@ import { collectStatus } from './lib/status.mjs'
 import { renderDiff, renderPull, renderPush, renderStatus, errorValue } from './lib/render.mjs'
 import { confirmSync, hasOpenTurn, makeEventGate, maybeAppendSessionEvent } from './lib/gate.mjs'
 import { sessionSyncDomainSpec } from './lib/domain.mjs'
+import { readArchiveMarkers, writeArchiveMarkers } from './lib/archive.mjs'
 
 export const name = PLUGIN_NAME
 
@@ -704,6 +706,42 @@ export async function apply(ctx, config = {}) {
   }
 
   /**
+   * Project DSH's additive archive set into immutable marker files inside the
+   * mirrored plaintext tree. The encrypted backend protects these markers
+   * together with Session bytes.
+   */
+  async function prepareArchiveMetadata({ repoDir: targetRepoDir, mirrorDir }) {
+    const registry = /** @type {any} */ (ctx).get('workspaceRegistry')
+    if (registry === undefined) return { changed: false }
+    const result = await writeArchiveMarkers({
+      repoDir: targetRepoDir,
+      mirrorDir,
+      sessionIds: registry.archivedSessionIds ?? [],
+    })
+    return { changed: result.written > 0 }
+  }
+
+  /**
+   * Apply remote archive markers after Session bytes have been restored. DSH
+   * currently has no unarchive operation, so archive synchronization is
+   * intentionally additive/set-union only.
+   */
+  async function applyArchiveMetadata({ repoDir: targetRepoDir, mirrorDir }) {
+    const registry = /** @type {any} */ (ctx).get('workspaceRegistry')
+    if (registry === undefined) return
+    const archived = new Set([...(registry.archivedSessionIds ?? [])].map(String))
+    for (const sessionId of await readArchiveMarkers({ repoDir: targetRepoDir, mirrorDir })) {
+      if (archived.has(sessionId)) continue
+      try {
+        await registry.archiveSession(sessionId)
+        archived.add(sessionId)
+      } catch (error) {
+        warn(`session-sync: archive marker for ${sessionId} could not be applied yet: ${messageOf(error)}`)
+      }
+    }
+  }
+
+  /**
    * Reconcile restored persistent sessions with an already-initialized DSH
    * Workspace registry. DSH intentionally does not infer membership from cwd
    * after first bootstrap, so cross-device imports must attach explicitly.
@@ -786,6 +824,8 @@ export async function apply(ctx, config = {}) {
       await refreshRestoredSessionProjections(restore)
       await reconcileRestoredSessions(restore)
     },
+    prepareMirrorMetadata: prepareArchiveMetadata,
+    applyMirrorMetadata: applyArchiveMetadata,
   }
   const engine = resolved.backend === BACKENDS.ENCRYPTED
     ? new EncryptedBackend({
@@ -964,6 +1004,29 @@ export async function apply(ctx, config = {}) {
   if (resolved.autoPullOnStart) {
     const result = await engine.pull()
     if (!result.ok) warn(`auto pull failed: ${result.error ?? 'unknown error'}`)
+  }
+
+  // Archive actions do not emit Session events. When automatic pushing is
+  // enabled, watch the durable workspace global state and push only when the
+  // archive set grows. Remote archive application happens during startup pull
+  // before this listener is installed, so it does not echo immediately.
+  if (resolved.autoPushOnTurnEnd) {
+    const registry = /** @type {any} */ (ctx).get('workspaceRegistry')
+    let knownArchived = new Set([...(registry?.archivedSessionIds ?? [])].map(String))
+    ctx.on('domain/changed', (change) => {
+      if (change?.domain !== 'workspace'
+        || change.table !== ''
+        || change.key !== ''
+        || change.operation !== 'put'
+        || !Array.isArray(change.value?.archivedSessionIds)) return
+      const next = new Set(change.value.archivedSessionIds.map(String))
+      const added = [...next].some(id => !knownArchived.has(id))
+      knownArchived = next
+      if (!added) return
+      void engine.push().then(result => {
+        if (!result.ok) warn(`auto push after archive failed: ${result.error ?? 'unknown error'}`)
+      })
+    })
   }
 
   // turn/end 自动推送（配置即授权；每轮结束拉一次快照并推送）。
