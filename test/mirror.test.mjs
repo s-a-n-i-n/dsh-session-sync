@@ -6,7 +6,7 @@ import assert from 'node:assert/strict'
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { mirrorSessionRoot, ensureDeviceFile } from '../lib/mirror.mjs'
+import { mirrorSessionRoot, ensureDeviceFile, restoreMirrorToSessionRoot } from '../lib/mirror.mjs'
 
 async function makeTemp() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dsh-session-sync-mirror-'))
@@ -96,4 +96,127 @@ test('ensureDeviceFile writes once and reports later identity changes', async (t
   assert.equal(await ensureDeviceFile(root, 'device.txt', 'dev-1'), false)
   assert.equal(await ensureDeviceFile(root, 'device.txt', 'dev-2'), true)
   assert.equal(await fs.readFile(path.join(root, 'device.txt'), 'utf8'), 'dev-2\n')
+})
+
+
+test('restore materializes mirror files back into sessionRoot without deleting local-only files', async (t) => {
+  const { root, clean } = await makeTemp()
+  t.after(clean)
+  const sessionRoot = path.join(root, 'sessions')
+  const repoDir = path.join(root, 'repo')
+  const mirrorRoot = path.join(repoDir, 'sessions')
+
+  await fs.mkdir(path.join(mirrorRoot, 'project', 'session-remote'), { recursive: true })
+  await fs.writeFile(path.join(mirrorRoot, 'project', 'session-remote', 'session.jsonl.zstd'), Buffer.from([1, 2, 3]))
+  await fs.mkdir(path.join(sessionRoot, 'project', 'session-local'), { recursive: true })
+  await fs.writeFile(path.join(sessionRoot, 'project', 'session-local', 'session.jsonl.zstd'), Buffer.from([9]))
+
+  const result = await restoreMirrorToSessionRoot({ sessionRoot, repoDir, mirrorDir: 'sessions' })
+
+  assert.equal(result.restored, 1)
+  assert.deepEqual(result.restoredSessionIds, ['session-remote'])
+  assert.deepEqual(result.availableSessionIds, ['session-remote'])
+  assert.deepEqual(
+    [...await fs.readFile(path.join(sessionRoot, 'project', 'session-remote', 'session.jsonl.zstd'))],
+    [1, 2, 3],
+  )
+  assert.deepEqual(
+    [...await fs.readFile(path.join(sessionRoot, 'project', 'session-local', 'session.jsonl.zstd'))],
+    [9],
+  )
+})
+
+test('restore updates inactive sessions, skips fork carriers, and can defer live sessions', async (t) => {
+  const { root, clean } = await makeTemp()
+  t.after(clean)
+  const sessionRoot = path.join(root, 'sessions')
+  const repoDir = path.join(root, 'repo')
+  const mirrorRoot = path.join(repoDir, 'sessions')
+  const sessionDir = path.join(mirrorRoot, 'project', 'session-live')
+
+  await fs.mkdir(sessionDir, { recursive: true })
+  await fs.writeFile(path.join(sessionDir, 'session.jsonl.zstd'), 'remote-new')
+  await fs.writeFile(
+    path.join(sessionDir, 'session.jsonl.zstd.remote-fork-20260909090000-a1b2c3d4'),
+    'remote-fork',
+  )
+  await fs.mkdir(path.join(sessionRoot, 'project', 'session-live'), { recursive: true })
+  await fs.writeFile(path.join(sessionRoot, 'project', 'session-live', 'session.jsonl.zstd'), 'local-old')
+
+  const deferred = await restoreMirrorToSessionRoot({
+    sessionRoot,
+    repoDir,
+    mirrorDir: 'sessions',
+    shouldRestoreSession: id => id !== 'session-live',
+  })
+  assert.equal(deferred.restored, 0)
+  assert.deepEqual(deferred.deferredSessionIds, ['session-live'])
+  assert.equal(
+    await fs.readFile(path.join(sessionRoot, 'project', 'session-live', 'session.jsonl.zstd'), 'utf8'),
+    'local-old',
+  )
+
+  const restored = await restoreMirrorToSessionRoot({ sessionRoot, repoDir, mirrorDir: 'sessions' })
+  assert.equal(restored.restored, 1)
+  assert.equal(
+    await fs.readFile(path.join(sessionRoot, 'project', 'session-live', 'session.jsonl.zstd'), 'utf8'),
+    'remote-new',
+  )
+  await assert.rejects(
+    fs.access(path.join(
+      sessionRoot,
+      'project',
+      'session-live',
+      'session.jsonl.zstd.remote-fork-20260909090000-a1b2c3d4',
+    )),
+  )
+})
+
+
+test('outbound mirror preserves deferred session bytes already present in the sync mirror', async (t) => {
+  const { root, clean } = await makeTemp()
+  t.after(clean)
+  const sessionRoot = path.join(root, 'sessions')
+  const repoDir = path.join(root, 'repo')
+  const live = path.join(sessionRoot, 'project', 'session-deferred', 'session.jsonl.zstd')
+  const mirror = path.join(repoDir, 'sessions', 'project', 'session-deferred', 'session.jsonl.zstd')
+  const mirrorExtra = path.join(repoDir, 'sessions', 'project', 'session-deferred', 'remote-only.bin')
+
+  await fs.mkdir(path.dirname(live), { recursive: true })
+  await fs.mkdir(path.dirname(mirror), { recursive: true })
+  await fs.writeFile(live, 'stale-live')
+  await fs.writeFile(mirror, 'newer-inbound')
+  await fs.writeFile(mirrorExtra, 'remote-only')
+
+  const result = await mirrorSessionRoot({
+    sessionRoot,
+    repoDir,
+    mirrorDir: 'sessions',
+    skipSessionIds: ['session-deferred'],
+  })
+
+  assert.deepEqual(result.skippedSessionIds, ['session-deferred'])
+  assert.equal(await fs.readFile(mirror, 'utf8'), 'newer-inbound')
+  assert.equal(await fs.readFile(mirrorExtra, 'utf8'), 'remote-only')
+})
+
+
+test('plugin carrier metadata is preserved in the mirror and never restored into DSH sessions', async (t) => {
+  const { root, clean } = await makeTemp()
+  t.after(clean)
+  const sessionRoot = path.join(root, 'sessions')
+  const repoDir = path.join(root, 'repo')
+  const carrier = path.join(repoDir, 'sessions', '.dsh-session-sync', 'archives', 'marker.json')
+
+  await fs.mkdir(sessionRoot, { recursive: true })
+  await fs.mkdir(path.dirname(carrier), { recursive: true })
+  await fs.writeFile(carrier, '{"version":1,"sessionId":"session-a"}\n')
+
+  const mirrored = await mirrorSessionRoot({ sessionRoot, repoDir, mirrorDir: 'sessions' })
+  assert.deepEqual(mirrored.carriersPreserved, ['.dsh-session-sync/archives/marker.json'])
+  assert.equal(await fs.readFile(carrier, 'utf8'), '{"version":1,"sessionId":"session-a"}\n')
+
+  const restored = await restoreMirrorToSessionRoot({ sessionRoot, repoDir, mirrorDir: 'sessions' })
+  assert.deepEqual(restored.skippedCarriers, ['.dsh-session-sync/archives/marker.json'])
+  await assert.rejects(fs.access(path.join(sessionRoot, '.dsh-session-sync', 'archives', 'marker.json')))
 })

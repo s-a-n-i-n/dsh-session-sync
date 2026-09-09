@@ -104,6 +104,8 @@ test('engine end-to-end: push, adopt, append-both fork, diverged fork, rejected 
   assert.equal(pull2.ok, true, `B first pull failed: ${pull2.error}`)
   assert.equal(pull2.pulled, true)
   assert.equal(await readWorktree(b.repoDir, 'sessions/s1/log.jsonl'), 'line1\n')
+  assert.equal(await fs.readFile(path.join(b.sessionRoot, 's1', 'log.jsonl'), 'utf8'), 'line1\n')
+  assert.equal(pull2.restored, 1)
 
   // 3) A 本地追加并推送。
   await writeSession(a.sessionRoot, 's1/log.jsonl', 'line1\nA-more\n')
@@ -133,6 +135,7 @@ test('engine end-to-end: push, adopt, append-both fork, diverged fork, rejected 
   assert.equal(pull6.appended, 0)
   assert.equal(pull6.forks.length, 0)
   assert.equal(await readWorktree(a.repoDir, 'sessions/s1/log.jsonl'), 'line1\nB-more\n')
+  assert.equal(await fs.readFile(path.join(a.sessionRoot, 's1', 'log.jsonl'), 'utf8'), 'line1\nB-more\n')
   const aStatus = await a.engine.status()
   assert.ok(aStatus.forks.some(fork => fork.includes('log.jsonl.remote-fork-')), 'A keeps the earlier fork file of its own version')
 
@@ -165,6 +168,73 @@ test('engine end-to-end: push, adopt, append-both fork, diverged fork, rejected 
   const status = await a.engine.status()
   assert.equal(status.ok, true, `A status failed: ${JSON.stringify(status.error)}`)
   assert.ok(status.behind >= 1, `A should be behind after B pushed (behind=${status.behind})`)
+})
+
+
+test('deferred inbound sessions block stale push and survive restart pull without mirror regression', { skip: !GIT_OK && 'git binary not available' }, async (t) => {
+  const { root, clean } = await makeTemp()
+  t.after(clean)
+  const remotePath = path.join(root, 'remote.git')
+  spawnSync('git', ['init', '--bare', remotePath], { stdio: 'ignore' })
+
+  const eventsA = { meta: [], errors: [], forks: [] }
+  const eventsB = { meta: [], errors: [], forks: [] }
+  const a = await setupDevice(root, 'A-guard', 'aaaaaaaa', remotePath, eventsA)
+  const b = await setupDevice(root, 'B-guard', 'bbbbbbbb', remotePath, eventsB)
+  const rel = 'project/session-guarded/log.jsonl'
+
+  await writeSession(a.sessionRoot, rel, 'base\n')
+  assert.equal((await a.engine.push()).ok, true)
+  assert.equal((await b.engine.pull()).ok, true)
+  assert.equal(await fs.readFile(path.join(b.sessionRoot, ...rel.split('/')), 'utf8'), 'base\n')
+
+  await writeSession(a.sessionRoot, rel, 'base\nremote-new\n')
+  assert.equal((await a.engine.push()).ok, true)
+
+  const deferred = new Set()
+  const reconcileDeferred = (restore) => {
+    const nowDeferred = new Set((restore.deferredSessionIds ?? []).map(String))
+    for (const sessionId of restore.availableSessionIds ?? []) {
+      if (!nowDeferred.has(String(sessionId))) deferred.delete(String(sessionId))
+    }
+    for (const sessionId of nowDeferred) deferred.add(sessionId)
+  }
+  const makeGuarded = (allowRestore) => new SyncEngine({
+    git: b.git,
+    sessionRoot: b.sessionRoot,
+    repoDir: b.repoDir,
+    remote: remotePath,
+    branch: 'main',
+    deviceId: 'bbbbbbbb',
+    reportMeta: (patch) => { eventsB.meta.push(patch) },
+    reportError: (message) => { eventsB.errors.push(message) },
+    onForks: (forkPaths) => { eventsB.forks.push(...forkPaths) },
+    shouldRestoreSession: () => allowRestore,
+    getDeferredSessionIds: () => [...deferred],
+    onRestored: reconcileDeferred,
+    logger: { debug() {}, info() {}, warn() {}, error() {} },
+  })
+
+  const liveGuarded = makeGuarded(false)
+  const deferredPull = await liveGuarded.pull()
+  assert.equal(deferredPull.ok, true)
+  assert.deepEqual(deferredPull.deferredSessionIds, ['session-guarded'])
+  assert.deepEqual([...deferred], ['session-guarded'])
+  assert.equal(await fs.readFile(path.join(b.sessionRoot, ...rel.split('/')), 'utf8'), 'base\n')
+  assert.equal(await readWorktree(b.repoDir, `sessions/${rel}`), 'base\nremote-new\n')
+
+  await writeSession(b.sessionRoot, rel, 'base\nstale-local\n')
+  const blockedPush = await liveGuarded.push()
+  assert.equal(blockedPush.ok, false)
+  assert.match(blockedPush.error, /push blocked: 1 session\(s\) have deferred inbound state/u)
+  assert.equal(await readWorktree(b.repoDir, `sessions/${rel}`), 'base\nremote-new\n')
+
+  const restarted = makeGuarded(true)
+  const restartPull = await restarted.pull()
+  assert.equal(restartPull.ok, true)
+  assert.deepEqual([...deferred], [])
+  assert.equal(await fs.readFile(path.join(b.sessionRoot, ...rel.split('/')), 'utf8'), 'base\nremote-new\n')
+  assert.equal(await readWorktree(b.repoDir, `sessions/${rel}`), 'base\nremote-new\n')
 })
 
 test('engine fails loudly without a configured remote', { skip: !GIT_OK && 'git binary not available' }, async (t) => {

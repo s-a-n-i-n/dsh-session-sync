@@ -18,6 +18,7 @@
 // （缺失 = 失败关闭）。lib/ 零 DSH 依赖，服务只在边界接线。
 
 import { randomUUID } from 'node:crypto'
+import path from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import SessionStore, { KNOWN_SESSION_EVENT_TYPES } from '@deepseek-ai/dsh-session'
@@ -29,6 +30,7 @@ import {
   CONFIRM_CHANNELS,
   DEFAULTS,
   LIMITS,
+  MIRROR_DIR,
   PLUGIN_NAME,
   SESSION_EVENTS,
   STATE_KEY,
@@ -52,6 +54,7 @@ import { collectStatus } from './lib/status.mjs'
 import { renderDiff, renderPull, renderPush, renderStatus, errorValue } from './lib/render.mjs'
 import { confirmSync, hasOpenTurn, makeEventGate, maybeAppendSessionEvent } from './lib/gate.mjs'
 import { sessionSyncDomainSpec } from './lib/domain.mjs'
+import { readArchiveMarkers, writeArchiveMarkers } from './lib/archive.mjs'
 
 export const name = PLUGIN_NAME
 
@@ -344,7 +347,7 @@ const TOOL_TEXT = {
 
 /** sync_status 工具规范结果（与工具 schema 同构）。 */
 /** @typedef {{ok: boolean, branch: string, remote: string, head?: string, remoteHead?: string, ahead: number, behind: number, dirty: string[], forks: string[], diffStat: string, mergeInProgress: boolean, lastCommits: string[], lastPullAt?: number, lastPushAt?: number, lastError?: string, error?: string, warnings?: string[]}} StatusValue */
-/** @typedef {{ok: boolean, pulled?: boolean, merged?: boolean, adopted?: number, appended?: number, diverged?: number, forks?: string[], head?: string, error?: string, warnings?: string[]}} PullValue */
+/** @typedef {{ok: boolean, pulled?: boolean, merged?: boolean, adopted?: number, appended?: number, diverged?: number, forks?: string[], head?: string, restored?: number, restoredSessionIds?: string[], deferredSessionIds?: string[], error?: string, warnings?: string[]}} PullValue */
 /** @typedef {{ok: boolean, pushed?: boolean, head?: string, mirrored?: number, deleted?: number, remote?: string, error?: string, warnings?: string[]}} PushValue */
 
 /**
@@ -391,7 +394,12 @@ export function makeSyncStatusTool(engine, readMeta) {
       const status = await engine.status()
       try {
         const meta = await readMeta()
-        return { ...status, lastPullAt: meta.lastPullAt, lastPushAt: meta.lastPushAt, lastError: meta.lastError }
+        return {
+          ...status,
+          ...(meta.lastPullAt === undefined ? {} : { lastPullAt: meta.lastPullAt }),
+          ...(meta.lastPushAt === undefined ? {} : { lastPushAt: meta.lastPushAt }),
+          ...(meta.lastError === undefined ? {} : { lastError: meta.lastError }),
+        }
       } catch {
         return status
       }
@@ -422,6 +430,9 @@ export function makeSyncPullTool(deps) {
           diverged: { type: 'integer' },
           forks: { type: 'array', items: { type: 'string' } },
           head: { type: 'string' },
+          restored: { type: 'integer' },
+          restoredSessionIds: { type: 'array', items: { type: 'string' } },
+          deferredSessionIds: { type: 'array', items: { type: 'string' } },
           error: { type: 'string' },
           warnings: { type: 'array', items: { type: 'string' } },
         },
@@ -548,7 +559,7 @@ export function injectForkNotice(child, forkPaths, parentId) {
  * @param {import('@deepseek-ai/cordis').Context} ctx - Cordis 上下文。
  * @param {Partial<Config>} [config] - 插件配置。
  */
-export function apply(ctx, config = {}) {
+export async function apply(ctx, config = {}) {
   const resolved = resolveConfig(config)
   if (resolved.enabled === false) return
 
@@ -568,7 +579,7 @@ export function apply(ctx, config = {}) {
   })
   tablePromise.catch(() => {}) // 消费方各自处理拒绝；此处仅避免未处理拒绝告警。
 
-  /** @type {{deviceId: string, lastPullAt?: number, lastPushAt?: number, lastPushHead?: string, lastError?: string}|undefined} 元数据缓存。 */
+  /** @type {{deviceId: string, lastPullAt?: number, lastPushAt?: number, lastPushHead?: string, lastError?: string, deferredSessionIds?: string[]}|undefined} 元数据缓存。 */
   let metaCache
   let metaOps = Promise.resolve()
   const withMeta = (fn) => {
@@ -610,6 +621,186 @@ export function apply(ctx, config = {}) {
     reportMeta({ lastError: message.slice(0, 500) })
   }
 
+  /** 持久化尚未能安全写回 live store 的 inbound 会话，作为 push 的 fail-closed 门。 */
+  async function reconcileDeferredState(restore) {
+    await withMeta(async () => {
+      const current = await ensureMeta()
+      const pending = new Set((current.deferredSessionIds ?? []).map(String))
+      const deferred = new Set((restore?.deferredSessionIds ?? []).map(String))
+      for (const sessionId of restore?.availableSessionIds ?? []) {
+        if (!deferred.has(String(sessionId))) pending.delete(String(sessionId))
+      }
+      for (const sessionId of deferred) pending.add(sessionId)
+      const nextIds = [...pending].sort()
+      const currentIds = [...(current.deferredSessionIds ?? [])].map(String).sort()
+      if (JSON.stringify(nextIds) === JSON.stringify(currentIds)) return
+      const next = { ...current, deferredSessionIds: nextIds }
+      const table = await tablePromise
+      await table.put(STATE_KEY, next)
+      metaCache = next
+    })
+  }
+
+  async function getDeferredSessionIds() {
+    const meta = await ensureMeta()
+    return [...(meta.deferredSessionIds ?? [])]
+  }
+
+  /**
+   * Refresh DSH's persisted projection cache after replacing a cold Session
+   * artifact. The Session log is authoritative, but the cache is keyed only by
+   * lifecycle identity and may still say an imported conversation is blank.
+   *
+   * SessionQuery gives us one exact cold observation; coldSnapshot folds the
+   * restored log and schedules the cache write-back. Poll the public cache read
+   * until that write is visible so autoPullOnStart remains a real readiness
+   * gate for the Web session list.
+   */
+  async function refreshRestoredSessionProjections(restore) {
+    const sessionIds = restore?.restoredSessionIds ?? []
+    if (sessionIds.length === 0) return
+
+    const query = /** @type {any} */ (ctx).get('sessionQuery')
+    const cache = /** @type {any} */ (ctx).get('sessionProjectionCache')
+    if (query === undefined || cache === undefined) {
+      logger.debug('session-sync: restored sessions kept existing projection-cache hints because projection services are unavailable')
+      return
+    }
+
+    for (const sessionId of sessionIds) {
+      if (ctx.sessions.get(sessionId) !== undefined) continue
+      /** @type {any} */
+      let observation
+      try {
+        observation = await query.observeSession(sessionId, { projectionMode: 'none' })
+        if (observation?.source !== 'prepared') continue
+
+        const refreshed = cache.coldSnapshot(
+          observation.header,
+          observation.inheritedEventCount,
+          observation.events,
+        )
+        const targetSeq = Number(refreshed?.asOfSeq ?? observation.cursor ?? -1)
+        const deadline = Date.now() + 2_000
+        for (;;) {
+          const current = cache.cachedSnapshot(
+            observation.header,
+            observation.inheritedEventCount,
+          )
+          if (Number(current?.asOfSeq ?? -1) >= targetSeq) break
+          if (Date.now() >= deadline) {
+            warn(`session-sync: restored session ${sessionId} projection-cache refresh did not become visible before readiness`)
+            break
+          }
+          await new Promise(resolve => setTimeout(resolve, 10))
+        }
+      } catch (error) {
+        warn(`session-sync: restored session ${sessionId} projection-cache refresh failed: ${messageOf(error)}`)
+      } finally {
+        try {
+          observation?.[Symbol.dispose]?.()
+        } catch {
+          // Observation disposal is best-effort and must not fail a completed restore.
+        }
+      }
+    }
+  }
+
+  /**
+   * Project DSH's additive archive set into immutable marker files inside the
+   * mirrored plaintext tree. The encrypted backend protects these markers
+   * together with Session bytes.
+   */
+  async function prepareArchiveMetadata({ repoDir: targetRepoDir, mirrorDir }) {
+    const registry = /** @type {any} */ (ctx).get('workspaceRegistry')
+    if (registry === undefined) return { changed: false }
+    const result = await writeArchiveMarkers({
+      repoDir: targetRepoDir,
+      mirrorDir,
+      sessionIds: registry.archivedSessionIds ?? [],
+    })
+    return { changed: result.written > 0 }
+  }
+
+  /**
+   * Apply remote archive markers after Session bytes have been restored. DSH
+   * currently has no unarchive operation, so archive synchronization is
+   * intentionally additive/set-union only.
+   */
+  async function applyArchiveMetadata({ repoDir: targetRepoDir, mirrorDir }) {
+    const registry = /** @type {any} */ (ctx).get('workspaceRegistry')
+    if (registry === undefined) return
+    const archived = new Set([...(registry.archivedSessionIds ?? [])].map(String))
+    for (const sessionId of await readArchiveMarkers({ repoDir: targetRepoDir, mirrorDir })) {
+      if (archived.has(sessionId)) continue
+      try {
+        await registry.archiveSession(sessionId)
+        archived.add(sessionId)
+      } catch (error) {
+        warn(`session-sync: archive marker for ${sessionId} could not be applied yet: ${messageOf(error)}`)
+      }
+    }
+  }
+
+  /**
+   * Reconcile restored persistent sessions with an already-initialized DSH
+   * Workspace registry. DSH intentionally does not infer membership from cwd
+   * after first bootstrap, so cross-device imports must attach explicitly.
+   *
+   * This is best-effort host integration: restored bytes remain valid even if
+   * a profile does not compose sessionPersistence/workspaceRegistry.
+   */
+  async function reconcileRestoredSessions(restore) {
+    const sessionIds = restore?.availableSessionIds ?? []
+    if (sessionIds.length === 0) return
+
+    const persistence = /** @type {any} */ (ctx).get('sessionPersistence')
+    const registry = /** @type {any} */ (ctx).get('workspaceRegistry')
+    if (persistence === undefined || registry === undefined) {
+      logger.debug('session-sync: restored sessions left ungrouped because workspace services are unavailable')
+      return
+    }
+
+    let snapshots
+    try {
+      snapshots = await persistence.list()
+    } catch (error) {
+      warn(`session-sync: restored sessions are on disk but workspace reconciliation could not list persistence: ${messageOf(error)}`)
+      return
+    }
+    const byId = new Map(snapshots.map(header => [String(header.id), header]))
+    const archived = new Set([...(registry.archivedSessionIds ?? [])].map(String))
+
+    for (const sessionId of sessionIds) {
+      const header = byId.get(String(sessionId))
+      if (header?.cwd === undefined || archived.has(String(sessionId))) continue
+      try {
+        let workspace = await registry.resolveByPath(header.cwd)
+        if (workspace === undefined) {
+          // Restored histories may contain obsolete cwd roots from an older
+          // machine layout. Avoid manufacturing a duplicate project workspace
+          // when the same directory leaf is already registered elsewhere;
+          // leave that historical Session ungrouped instead.
+          const leafOf = value => path.posix.basename(String(value).replaceAll('\\', '/')).toLocaleLowerCase()
+          const incomingLeaf = leafOf(header.cwd)
+          const collision = registry.list().find(candidate =>
+            leafOf(candidate.path) === incomingLeaf)
+          if (collision !== undefined) {
+            warn(`session-sync: restored session ${sessionId} has cwd ${header.cwd}, but project ${path.basename(header.cwd)} is already registered at ${collision.path}; leaving it ungrouped`)
+            continue
+          }
+          // Cross-device restore can arrive before this machine has ever
+          // registered the Session cwd as a Workspace. DSH's public create()
+          // is idempotent by canonical path and validates the local directory.
+          workspace = await registry.create(header.cwd)
+        }
+        await workspace.attachSession(sessionId)
+      } catch (error) {
+        warn(`session-sync: restored session ${sessionId} is on disk but could not create/attach its workspace: ${messageOf(error)}`)
+      }
+    }
+  }
+
   // --- git 后端 + 引擎（backend seam：git = 明文，encrypted = age 加密的 git）。
   const git = new GitBackend({
     repoDir,
@@ -637,6 +828,17 @@ export function apply(ctx, config = {}) {
     reportError,
     logger,
     onForks: (forkPaths) => handleForks(forkPaths),
+    // Never overwrite a Session currently owned by the live host. A later
+    // pull/restart can materialize the deferred remote version safely.
+    shouldRestoreSession: (sessionId) => ctx.sessions.get(sessionId) === undefined,
+    getDeferredSessionIds,
+    onRestored: async (restore) => {
+      await reconcileDeferredState(restore)
+      await refreshRestoredSessionProjections(restore)
+      await reconcileRestoredSessions(restore)
+    },
+    prepareMirrorMetadata: prepareArchiveMetadata,
+    applyMirrorMetadata: applyArchiveMetadata,
   }
   const engine = resolved.backend === BACKENDS.ENCRYPTED
     ? new EncryptedBackend({
@@ -652,10 +854,13 @@ export function apply(ctx, config = {}) {
         timeoutMs: resolved.commandTimeoutMs,
       })
     : new SyncEngine(engineDeps)
-  // 设备 id 来自元数据领域；在领域就绪后补齐（fork 命名/设备文件用）。
-  void ensureMeta().then((meta) => {
+  // 设备 id 与 deferred push gate 都来自持久元数据；插件 ready 前完成初始化。
+  try {
+    const meta = await ensureMeta()
     engine.deviceId = meta.deviceId
-  }).catch(error => warn(`sync metadata open failed: ${messageOf(error)}`))
+  } catch (error) {
+    warn(`sync metadata open failed: ${messageOf(error)}`)
+  }
 
   /** fork 文件产生回调：尝试把冲突会话在会话层面 fork（安全时）。 */
   function handleForks(forkPaths) {
@@ -806,15 +1011,36 @@ export function apply(ctx, config = {}) {
     })
   }
 
-  // --- 自动模式（全部 effect：事件/定时随插件卸载自动撤销）。
-  // 挂载时自动拉取（配置即授权；失败只记日志，绝不阻断启动）。
+  // --- 自动模式。
+  // 启动拉取是 readiness gate：在插件 apply 完成前 fetch/merge/materialize，
+  // 避免 Web 在旧持久化字节上先 resume Session，导致 inbound 更新永久 deferred。
   if (resolved.autoPullOnStart) {
-    ctx.effect(() => {
-      void engine.pull().then(result => {
-        if (!result.ok) warn(`auto pull failed: ${result.error ?? 'unknown error'}`)
+    const result = await engine.pull()
+    if (!result.ok) warn(`auto pull failed: ${result.error ?? 'unknown error'}`)
+  }
+
+  // Archive actions do not emit Session events. When automatic pushing is
+  // enabled, watch the durable workspace global state and push only when the
+  // archive set grows. Remote archive application happens during startup pull
+  // before this listener is installed, so it does not echo immediately.
+  if (resolved.autoPushOnTurnEnd) {
+    const registry = /** @type {any} */ (ctx).get('workspaceRegistry')
+    let knownArchived = new Set([...(registry?.archivedSessionIds ?? [])].map(String))
+    ctx.on('domain/changed', (change) => {
+      const value = /** @type {any} */ (change?.value)
+      if (change?.domain !== 'workspace'
+        || change.table !== ''
+        || change.key !== ''
+        || change.operation !== 'put'
+        || !Array.isArray(value?.archivedSessionIds)) return
+      const next = new Set(value.archivedSessionIds.map(String))
+      const added = [...next].some(id => !knownArchived.has(id))
+      knownArchived = next
+      if (!added) return
+      void engine.push().then(result => {
+        if (!result.ok) warn(`auto push after archive failed: ${result.error ?? 'unknown error'}`)
       })
-      return () => {}
-    }, `${PLUGIN_NAME}.auto-pull-on-start`)
+    })
   }
 
   // turn/end 自动推送（配置即授权；每轮结束拉一次快照并推送）。
