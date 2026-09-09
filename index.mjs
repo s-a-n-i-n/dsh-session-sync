@@ -18,6 +18,7 @@
 // （缺失 = 失败关闭）。lib/ 零 DSH 依赖，服务只在边界接线。
 
 import { randomUUID } from 'node:crypto'
+import path from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import SessionStore, { KNOWN_SESSION_EVENT_TYPES } from '@deepseek-ai/dsh-session'
@@ -768,17 +769,28 @@ export async function apply(ctx, config = {}) {
       return
     }
     const byId = new Map(snapshots.map(header => [String(header.id), header]))
+    const archived = new Set([...(registry.archivedSessionIds ?? [])].map(String))
 
     for (const sessionId of sessionIds) {
       const header = byId.get(String(sessionId))
-      if (header?.cwd === undefined) continue
+      if (header?.cwd === undefined || archived.has(String(sessionId))) continue
       try {
         let workspace = await registry.resolveByPath(header.cwd)
         if (workspace === undefined) {
+          // Restored histories may contain obsolete cwd roots from an older
+          // machine layout. Avoid manufacturing a duplicate project workspace
+          // when the same directory leaf is already registered elsewhere;
+          // leave that historical Session ungrouped instead.
+          const incomingLeaf = path.basename(header.cwd).toLocaleLowerCase()
+          const collision = registry.list().find(candidate =>
+            path.basename(candidate.path).toLocaleLowerCase() === incomingLeaf)
+          if (collision !== undefined) {
+            warn(`session-sync: restored session ${sessionId} has cwd ${header.cwd}, but project ${path.basename(header.cwd)} is already registered at ${collision.path}; leaving it ungrouped`)
+            continue
+          }
           // Cross-device restore can arrive before this machine has ever
           // registered the Session cwd as a Workspace. DSH's public create()
-          // is idempotent by canonical path, validates that the directory
-          // exists locally, and derives the normal default title from it.
+          // is idempotent by canonical path and validates the local directory.
           workspace = await registry.create(header.cwd)
         }
         await workspace.attachSession(sessionId)
