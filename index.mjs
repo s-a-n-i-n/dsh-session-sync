@@ -644,7 +644,7 @@ export function apply(ctx, config = {}) {
       warn(`session-sync: restored sessions are on disk but workspace reconciliation could not list persistence: ${messageOf(error)}`)
       return
     }
-    const byId = new Map(snapshots.map(snapshot => [String(snapshot.header.id), snapshot.header]))
+    const byId = new Map(snapshots.map(header => [String(header.id), header]))
 
     for (const sessionId of sessionIds) {
       const header = byId.get(String(sessionId))
