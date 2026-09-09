@@ -644,6 +644,66 @@ export async function apply(ctx, config = {}) {
   }
 
   /**
+   * Refresh DSH's persisted projection cache after replacing a cold Session
+   * artifact. The Session log is authoritative, but the cache is keyed only by
+   * lifecycle identity and may still say an imported conversation is blank.
+   *
+   * SessionQuery gives us one exact cold observation; coldSnapshot folds the
+   * restored log and schedules the cache write-back. Poll the public cache read
+   * until that write is visible so autoPullOnStart remains a real readiness
+   * gate for the Web session list.
+   */
+  async function refreshRestoredSessionProjections(restore) {
+    const sessionIds = restore?.restoredSessionIds ?? []
+    if (sessionIds.length === 0) return
+
+    const query = /** @type {any} */ (ctx).get('sessionQuery')
+    const cache = /** @type {any} */ (ctx).get('sessionProjectionCache')
+    if (query === undefined || cache === undefined) {
+      logger.debug('session-sync: restored sessions kept existing projection-cache hints because projection services are unavailable')
+      return
+    }
+
+    for (const sessionId of sessionIds) {
+      if (ctx.sessions.get(sessionId) !== undefined) continue
+      /** @type {any} */
+      let observation
+      try {
+        observation = await query.observeSession(sessionId, { projectionMode: 'none' })
+        if (observation?.source !== 'prepared') continue
+
+        const refreshed = cache.coldSnapshot(
+          observation.header,
+          observation.inheritedEventCount,
+          observation.events,
+        )
+        const targetSeq = Number(refreshed?.asOfSeq ?? observation.cursor ?? -1)
+        const deadline = Date.now() + 2_000
+        for (;;) {
+          const current = cache.cachedSnapshot(
+            observation.header,
+            observation.inheritedEventCount,
+          )
+          if (Number(current?.asOfSeq ?? -1) >= targetSeq) break
+          if (Date.now() >= deadline) {
+            warn(`session-sync: restored session ${sessionId} projection-cache refresh did not become visible before readiness`)
+            break
+          }
+          await new Promise(resolve => setTimeout(resolve, 10))
+        }
+      } catch (error) {
+        warn(`session-sync: restored session ${sessionId} projection-cache refresh failed: ${messageOf(error)}`)
+      } finally {
+        try {
+          observation?.[Symbol.dispose]?.()
+        } catch {
+          // Observation disposal is best-effort and must not fail a completed restore.
+        }
+      }
+    }
+  }
+
+  /**
    * Reconcile restored persistent sessions with an already-initialized DSH
    * Workspace registry. DSH intentionally does not infer membership from cwd
    * after first bootstrap, so cross-device imports must attach explicitly.
@@ -717,6 +777,7 @@ export async function apply(ctx, config = {}) {
     getDeferredSessionIds,
     onRestored: async (restore) => {
       await reconcileDeferredState(restore)
+      await refreshRestoredSessionProjections(restore)
       await reconcileRestoredSessions(restore)
     },
   }
