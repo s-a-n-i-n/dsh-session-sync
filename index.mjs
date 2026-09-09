@@ -735,11 +735,17 @@ export async function apply(ctx, config = {}) {
       const header = byId.get(String(sessionId))
       if (header?.cwd === undefined) continue
       try {
-        const workspace = await registry.resolveByPath(header.cwd)
-        if (workspace === undefined) continue
+        let workspace = await registry.resolveByPath(header.cwd)
+        if (workspace === undefined) {
+          // Cross-device restore can arrive before this machine has ever
+          // registered the Session cwd as a Workspace. DSH's public create()
+          // is idempotent by canonical path, validates that the directory
+          // exists locally, and derives the normal default title from it.
+          workspace = await registry.create(header.cwd)
+        }
         await workspace.attachSession(sessionId)
       } catch (error) {
-        warn(`session-sync: restored session ${sessionId} is on disk but could not attach to its workspace: ${messageOf(error)}`)
+        warn(`session-sync: restored session ${sessionId} is on disk but could not create/attach its workspace: ${messageOf(error)}`)
       }
     }
   }
