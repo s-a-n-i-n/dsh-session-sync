@@ -199,3 +199,24 @@ test('outbound mirror preserves deferred session bytes already present in the sy
   assert.equal(await fs.readFile(mirror, 'utf8'), 'newer-inbound')
   assert.equal(await fs.readFile(mirrorExtra, 'utf8'), 'remote-only')
 })
+
+
+test('plugin carrier metadata is preserved in the mirror and never restored into DSH sessions', async (t) => {
+  const { root, clean } = await makeTemp()
+  t.after(clean)
+  const sessionRoot = path.join(root, 'sessions')
+  const repoDir = path.join(root, 'repo')
+  const carrier = path.join(repoDir, 'sessions', '.dsh-session-sync', 'archives', 'marker.json')
+
+  await fs.mkdir(sessionRoot, { recursive: true })
+  await fs.mkdir(path.dirname(carrier), { recursive: true })
+  await fs.writeFile(carrier, '{"version":1,"sessionId":"session-a"}\n')
+
+  const mirrored = await mirrorSessionRoot({ sessionRoot, repoDir, mirrorDir: 'sessions' })
+  assert.deepEqual(mirrored.carriersPreserved, ['.dsh-session-sync/archives/marker.json'])
+  assert.equal(await fs.readFile(carrier, 'utf8'), '{"version":1,"sessionId":"session-a"}\n')
+
+  const restored = await restoreMirrorToSessionRoot({ sessionRoot, repoDir, mirrorDir: 'sessions' })
+  assert.deepEqual(restored.skippedCarriers, ['.dsh-session-sync/archives/marker.json'])
+  await assert.rejects(fs.access(path.join(sessionRoot, '.dsh-session-sync', 'archives', 'marker.json')))
+})
