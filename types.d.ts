@@ -124,6 +124,12 @@ export interface PullValue {
   diverged?: number
   forks?: string[]
   head?: string
+  /** Number of mirror files materialized into the live DSH session store. */
+  restored?: number
+  /** Sessions whose mirror bytes are now available in the live store. */
+  restoredSessionIds?: string[]
+  /** Sessions deferred because the host currently owns them live. */
+  deferredSessionIds?: string[]
   error?: string
   warnings?: string[]
 }
