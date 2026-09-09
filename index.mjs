@@ -556,7 +556,7 @@ export function injectForkNotice(child, forkPaths, parentId) {
  * @param {import('@deepseek-ai/cordis').Context} ctx - Cordis 上下文。
  * @param {Partial<Config>} [config] - 插件配置。
  */
-export function apply(ctx, config = {}) {
+export async function apply(ctx, config = {}) {
   const resolved = resolveConfig(config)
   if (resolved.enabled === false) return
 
@@ -576,7 +576,7 @@ export function apply(ctx, config = {}) {
   })
   tablePromise.catch(() => {}) // 消费方各自处理拒绝；此处仅避免未处理拒绝告警。
 
-  /** @type {{deviceId: string, lastPullAt?: number, lastPushAt?: number, lastPushHead?: string, lastError?: string}|undefined} 元数据缓存。 */
+  /** @type {{deviceId: string, lastPullAt?: number, lastPushAt?: number, lastPushHead?: string, lastError?: string, deferredSessionIds?: string[]}|undefined} 元数据缓存。 */
   let metaCache
   let metaOps = Promise.resolve()
   const withMeta = (fn) => {
@@ -616,6 +616,31 @@ export function apply(ctx, config = {}) {
   /** 最近错误（引擎回调；串行写领域）。 */
   function reportError(message) {
     reportMeta({ lastError: message.slice(0, 500) })
+  }
+
+  /** 持久化尚未能安全写回 live store 的 inbound 会话，作为 push 的 fail-closed 门。 */
+  async function reconcileDeferredState(restore) {
+    await withMeta(async () => {
+      const current = await ensureMeta()
+      const pending = new Set((current.deferredSessionIds ?? []).map(String))
+      const deferred = new Set((restore?.deferredSessionIds ?? []).map(String))
+      for (const sessionId of restore?.availableSessionIds ?? []) {
+        if (!deferred.has(String(sessionId))) pending.delete(String(sessionId))
+      }
+      for (const sessionId of deferred) pending.add(sessionId)
+      const nextIds = [...pending].sort()
+      const currentIds = [...(current.deferredSessionIds ?? [])].map(String).sort()
+      if (JSON.stringify(nextIds) === JSON.stringify(currentIds)) return
+      const next = { ...current, deferredSessionIds: nextIds }
+      const table = await tablePromise
+      await table.put(STATE_KEY, next)
+      metaCache = next
+    })
+  }
+
+  async function getDeferredSessionIds() {
+    const meta = await ensureMeta()
+    return [...(meta.deferredSessionIds ?? [])]
   }
 
   /**
@@ -689,7 +714,11 @@ export function apply(ctx, config = {}) {
     // Never overwrite a Session currently owned by the live host. A later
     // pull/restart can materialize the deferred remote version safely.
     shouldRestoreSession: (sessionId) => ctx.sessions.get(sessionId) === undefined,
-    onRestored: (restore) => reconcileRestoredSessions(restore),
+    getDeferredSessionIds,
+    onRestored: async (restore) => {
+      await reconcileDeferredState(restore)
+      await reconcileRestoredSessions(restore)
+    },
   }
   const engine = resolved.backend === BACKENDS.ENCRYPTED
     ? new EncryptedBackend({
@@ -705,10 +734,13 @@ export function apply(ctx, config = {}) {
         timeoutMs: resolved.commandTimeoutMs,
       })
     : new SyncEngine(engineDeps)
-  // 设备 id 来自元数据领域；在领域就绪后补齐（fork 命名/设备文件用）。
-  void ensureMeta().then((meta) => {
+  // 设备 id 与 deferred push gate 都来自持久元数据；插件 ready 前完成初始化。
+  try {
+    const meta = await ensureMeta()
     engine.deviceId = meta.deviceId
-  }).catch(error => warn(`sync metadata open failed: ${messageOf(error)}`))
+  } catch (error) {
+    warn(`sync metadata open failed: ${messageOf(error)}`)
+  }
 
   /** fork 文件产生回调：尝试把冲突会话在会话层面 fork（安全时）。 */
   function handleForks(forkPaths) {
@@ -859,15 +891,12 @@ export function apply(ctx, config = {}) {
     })
   }
 
-  // --- 自动模式（全部 effect：事件/定时随插件卸载自动撤销）。
-  // 挂载时自动拉取（配置即授权；失败只记日志，绝不阻断启动）。
+  // --- 自动模式。
+  // 启动拉取是 readiness gate：在插件 apply 完成前 fetch/merge/materialize，
+  // 避免 Web 在旧持久化字节上先 resume Session，导致 inbound 更新永久 deferred。
   if (resolved.autoPullOnStart) {
-    ctx.effect(() => {
-      void engine.pull().then(result => {
-        if (!result.ok) warn(`auto pull failed: ${result.error ?? 'unknown error'}`)
-      })
-      return () => {}
-    }, `${PLUGIN_NAME}.auto-pull-on-start`)
+    const result = await engine.pull()
+    if (!result.ok) warn(`auto pull failed: ${result.error ?? 'unknown error'}`)
   }
 
   // turn/end 自动推送（配置即授权；每轮结束拉一次快照并推送）。
